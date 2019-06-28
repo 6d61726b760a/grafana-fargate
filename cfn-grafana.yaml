@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: grafana
+
+Parameters:
+  ContainerSubnets:
+    Type: "List<AWS::EC2::Subnet::Id>"
+
+  ContainerVpcId:
+    Type: "AWS::EC2::VPC::Id"
+
+  LoadBalancerSubnets:
+    Type: "List<AWS::EC2::Subnet::Id>"
+
+  LoadBalancerVpcId:
+    Type: "AWS::EC2::VPC::Id"
+
+  LogGroup:
+    Type: String
+    Default: /aws/ecs
+    Description: Note that this must exist prior to deployment
+
+Resources:
+  Cluster:
+    Type: "AWS::ECS::Cluster"
+
+  ContainerSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Traffic between ALB and Containers
+      SecurityGroupIngress:
+        - FromPort: 3000
+          IpProtocol: tcp
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          ToPort: 3000
+      VpcId: !Ref ContainerVpcId
+
+  InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: /
+      Roles:
+        - Ref: Role
+
+  LoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Scheme: internal
+      SecurityGroups:
+        - Ref: LoadBalancerSecurityGroup
+      Subnets: !Ref LoadBalancerSubnets
+
+  LoadBalancerListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  LoadBalancerSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Traffic to ALB
+      SecurityGroupIngress:
+        - CidrIp: "10.0.0.0/8"
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+        - CidrIp: "172.16.0.0/12"
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+      VpcId: !Ref LoadBalancerVpcId
+
+  Role:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - ecs.amazonaws.com
+                - ec2.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+        - "arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess"
+        - "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
+        - "arn:aws:iam::aws:policy/ResourceGroupsandTagEditorReadOnlyAccess"
+      Policies:
+        - PolicyName: grafana_params_and_secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm:GetParameters"
+                  - "secretsmanager:GetSecretValue"
+                  - "kms:Decrypt"
+                Resource:
+                  - "arn:aws:ssm:ap-southeast-2:XXXXXXXXXXXX:parameter/grafana/*"
+                  - "arn:aws:secretsmanager:ap-southeast-2:XXXXXXXXXXXX:secret:grafana_rds-XXXXXX"
+                  - "arn:aws:kms:ap-southeast-2:XXXXXXXXXXXX:key/XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+
+  Service:
+    Type: "AWS::ECS::Service"
+    DependsOn:
+      - LoadBalancerListener
+    Properties:
+      Cluster: !Ref Cluster
+      DesiredCount: 3
+      HealthCheckGracePeriodSeconds: 30
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: grafana
+          ContainerPort: 3000
+          TargetGroupArn: !Ref TargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - Ref: ContainerSecurityGroup
+          Subnets: !Ref ContainerSubnets
+      TaskDefinition: !Ref TaskDefinition
+
+  TargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    DependsOn: LoadBalancer
+    Properties:
+      HealthCheckPath: /login
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref ContainerVpcId
+
+  TaskDefinition:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      ContainerDefinitions:
+        - Environment:
+            - Name: HTTP_PROXY
+              Value: "http://proxy:8080"
+            - Name: HTTPS_PROXY
+              Value: "http://proxy:8080"
+            - Name: NO_PROXY
+              Value: localhost,169.254.169.254,169.254.170.2
+            - Name: GF_INSTALL_PLUGINS
+              Value: grafana-clock-panel,grafana-simple-json-datasource
+            - Name: GF_LOG_LEVEL
+              Value: debug
+            - Name: GF_DATABASE_TYPE
+              Value: postgres
+          Essential: true
+          Image: "dockerregistry/grafana:latest"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: grafana-nonprod
+          Name: grafana
+          PortMappings:
+            - ContainerPort: 3000
+          Secrets:
+            - Name: GF_DATABASE_PASSWORD
+              ValueFrom: "arn:aws:secretsmanager:ap-southeast-2:XXXXXXXXXXXX:secret:grafana_rds-XXXXXX"
+            - Name: GF_DATABASE_USER
+              ValueFrom: "arn:aws:ssm:ap-southeast-2:XXXXXXXXXXXX:parameter/grafana/GF_DATABASE_USER"
+            - Name: GF_DATABASE_HOST
+              ValueFrom: "arn:aws:ssm:ap-southeast-2:XXXXXXXXXXXX:parameter/grafana/GF_DATABASE_HOST"
+      Cpu: "256"
+      ExecutionRoleArn: !Sub ${Role.Arn}
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Sub ${Role.Arn}
+
+Outputs:
+  ServiceUrl:
+    Value: !Sub ${LoadBalancer.DNSName}
